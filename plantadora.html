@@ -90,7 +90,9 @@ details ol { margin: 6px 0 0; padding-left: 1.2em; display: flex; flex-direction
 .boton-gps.activo { background: #1565c0; color: #fff; }
 .leaflet-control-layers-expanded { font-size: 0.95rem; line-height: 1.9; }
 .leaflet-touch .leaflet-control-layers-toggle { width: 44px; height: 44px; }
-.vertice { width: 22px; height: 22px; border-radius: 50%; background: #fff; border: 3px solid #d32f2f; box-sizing: border-box; }
+.vertice { width: 24px; height: 24px; border-radius: 50%; background: #fff; border: 3px solid #d32f2f; box-sizing: border-box; }
+.vertice.sel { background: #d32f2f; border-color: #fff; }
+.vertice-medio { width: 18px; height: 18px; border-radius: 50%; background: rgba(255,255,255,0.55); border: 2px solid #d32f2f; box-sizing: border-box; }
 code { font-family: var(--mono); font-size: 0.88em; background: var(--soft); padding: 1px 4px; border-radius: 3px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -1000,7 +1002,7 @@ mapa.on('zoomend overlayadd overlayremove', verArboles);
 
 /* estado.piezas: lo elegido para la linde (recintos, parcelas, dibujos, archivos); la linde es su unión. */
 const estado = { piezas: [], poligonos: null, zonas: [], origen: '', modo: null, puntos: [], resultado: null, idEditando: null,
-  areaConteo: null, gps: null, editandoZona: null, ancla: null };
+  areaConteo: null, gps: null, ancla: null };
 const ll = (p) => [p[1], p[0]];
 
 /* ----------------------------------------------------------- GPS en vivo */
@@ -1042,14 +1044,15 @@ function posicionActual() {
 /* ------------------------------------------------------------ modos */
 const MODOS_DIBUJO = { dibujar: 'Terminar', zona: 'Terminar zona', contar: 'Contar' };
 function ponerModo(modo, texto) {
-  estado.modo = modo; estado.puntos = []; capaTemp.clearLayers(); estado.editandoZona = null;
+  estado.modo = modo; estado.puntos = []; capaTemp.clearLayers();
   for (const [id, m] of [['bSigpac', 'sigpac'], ['bCatastro', 'catastro'], ['bDibujar', 'dibujar'], ['bRumboLado', 'lado'], ['bRumbo2p', 'dos'], ['bZona', 'zona'], ['bContar', 'contar']]) $(id).classList.toggle('activo', modo === m);
   const b = $('modo');
   if (!modo) { b.hidden = true; b.innerHTML = ''; pintarZonas(); return; }
   b.innerHTML = '';
   const s = document.createElement('span'); s.textContent = texto; b.appendChild(s);
   if (MODOS_DIBUJO[modo]) b.append(boton('Deshacer', deshacerPunto), boton(MODOS_DIBUJO[modo], terminarDibujo));
-  b.appendChild(boton(['sigpac', 'catastro', 'editarZona', 'elegir'].includes(modo) ? 'Hecho' : 'Cancelar', () => ponerModo(null)));
+  if (modo === 'editar') b.appendChild(boton('Borrar punto', () => estado.borrarPunto()));
+  b.appendChild(boton(['sigpac', 'catastro', 'editar', 'elegir'].includes(modo) ? 'Hecho' : 'Cancelar', () => ponerModo(null)));
   b.hidden = false;
 }
 
@@ -1120,7 +1123,9 @@ function pintarPiezas() {
   estado.piezas.forEach((pz) => {
     const f = document.createElement('div'); f.className = 'pieza';
     const t = document.createElement('span'); t.textContent = pz.origen;
-    f.append(t, boton('Quitar', () => ponerPieza(pz), 'peligro'));
+    const acc = document.createElement('div'); acc.className = 'botones';
+    acc.append(boton('Editar', () => editarPieza(pz)), boton('Quitar', () => ponerPieza(pz), 'peligro'));
+    f.append(t, acc);
     caja.appendChild(f);
   });
   if (estado.piezas.length > 1) caja.appendChild(boton('Quitar todo', () => { estado.piezas = []; actualizarLinde(); }, 'peligro'));
@@ -1337,17 +1342,46 @@ function pintarZonas() {
   });
 }
 /* Edición: cada vértice se arrastra; la zona se recalcula al soltar. */
-function editarZona(z) {
-  ponerModo('editarZona', 'Arrastra los puntos rojos para cambiar la zona.');
-  estado.editandoZona = z;
-  const vert = z.anillo.slice(0, -1).map((p) => ll(p));
-  const linea = L.polygon(vert, { color: '#d32f2f', weight: 3, dashArray: '6 6', fill: false, interactive: false }).addTo(capaTemp);
-  vert.forEach((q, i) => {
-    const m = L.marker(q, { draggable: true, icon: L.divIcon({ className: '', html: '<div class="vertice"></div>', iconSize: [22, 22], iconAnchor: [11, 11] }) }).addTo(capaTemp);
-    m.on('drag', (ev) => { vert[i] = ev.target.getLatLng(); linea.setLatLngs(vert); });
-    m.on('dragend', () => { z.anillo = Nucleo.cerrar(vert.map((x) => [x.lng, x.lat])); recalcular(); });
-  });
+/* Editor de un contorno: se arrastran los vértices; el punto pequeño en mitad de cada lado añade un vértice;
+   se toca un vértice y «Borrar punto» lo quita. Cada cambio se guarda al soltar. */
+function editarAnillo(anillo, color, texto, alCambiar) {
+  ponerModo('editar', texto);
+  const vert = anillo.slice(0, -1).map((p) => L.latLng(p[1], p[0]));
+  let sel = -1, linea = null;
+  const icono = (clase, t) => L.divIcon({ className: '', html: '<div class="' + clase + '"></div>', iconSize: [t, t], iconAnchor: [t / 2, t / 2] });
+  const guardar = () => alCambiar(Nucleo.cerrar(vert.map((x) => [x.lng, x.lat])));
+  const dibujar = () => {
+    capaTemp.clearLayers();
+    linea = L.polygon(vert, { color, weight: 3, dashArray: '6 6', fill: false, interactive: false }).addTo(capaTemp);
+    vert.forEach((q, i) => {
+      const k = (i + 1) % vert.length, medio = L.latLng((q.lat + vert[k].lat) / 2, (q.lng + vert[k].lng) / 2);
+      L.marker(medio, { icon: icono('vertice-medio', 18), zIndexOffset: -100 }).on('click', (ev) => {
+        L.DomEvent.stopPropagation(ev); vert.splice(k, 0, medio); sel = k; guardar(); dibujar();
+      }).addTo(capaTemp);
+      const m = L.marker(q, { draggable: true, icon: icono(i === sel ? 'vertice sel' : 'vertice', 24) }).addTo(capaTemp);
+      m.on('drag', (ev) => { vert[i] = ev.target.getLatLng(); linea.setLatLngs(vert); });
+      m.on('dragend', () => { sel = i; guardar(); dibujar(); });
+      m.on('click', (ev) => { L.DomEvent.stopPropagation(ev); sel = i; dibujar(); });
+    });
+  };
+  estado.borrarPunto = () => {
+    if (sel < 0) return aviso('Toca primero el punto que quieres borrar.', true);
+    if (vert.length <= 3) return aviso('Tiene que quedar al menos un triángulo.', true);
+    vert.splice(sel, 1); sel = -1; guardar(); dibujar();
+  };
+  dibujar();
   mapa.fitBounds(L.latLngBounds(vert), { padding: [60, 60], maxZoom: 19 });
+}
+function editarZona(z) {
+  editarAnillo(z.anillo, '#d32f2f', 'Zona: arrastra los puntos; el pequeño de cada lado añade uno.', (r) => { z.anillo = r; pintarZonas(); recalcular(); });
+}
+/* Recinto o parcela de la linde: se corrige su contorno (los de SIGPAC a veces no van por la linde real). */
+function editarPieza(pz) {
+  editarAnillo(pz.pol[0], '#ffd60a', 'Recinto: arrastra los puntos; el pequeño de cada lado añade uno.', (r) => {
+    pz.pol = [r, ...pz.pol.slice(1)];
+    if (!/ \(editado\)$/.test(pz.origen)) pz.origen += ' (editado)';
+    actualizarLinde(false);
+  });
 }
 $('bZona').onclick = () => ponerModo('zona', 'Toca los vértices de la zona sin plantar.');
 
