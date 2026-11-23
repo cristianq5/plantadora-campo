@@ -72,6 +72,9 @@ button.peligro { border-color: var(--bad); color: var(--bad); }
   background: var(--fg); color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 0.95rem; display: flex; gap: 8px;
   align-items: center; flex-wrap: wrap; justify-content: center; }
 #modo button { min-height: 36px; padding: 4px 10px; background: #fff; }
+#desfase { position: absolute; z-index: 1000; left: 10px; bottom: 24px; max-width: calc(100% - 20px); background: rgba(26,31,20,0.88); color: #fff;
+  padding: 8px 12px; border-radius: 6px; font-size: 0.95rem; font-variant-numeric: tabular-nums; pointer-events: none; }
+#desfase b { font-size: 1.1rem; }
 #toast { position: fixed; z-index: 2000; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--fg); color: #fff;
   padding: 10px 16px; border-radius: 6px; max-width: min(90vw, 520px); font-size: 0.95rem; }
 #toast.mal { background: var(--bad); }
@@ -107,6 +110,7 @@ code { font-family: var(--mono); font-size: 0.88em; background: var(--soft); pad
 <div id="mapa" role="application" aria-label="Mapa"></div>
 <div id="modo" hidden></div>
 <div id="toast" hidden></div>
+<div id="desfase" hidden></div>
 
 <aside id="panel">
   <h1>Plantadora Trimble</h1>
@@ -405,7 +409,8 @@ const Nucleo = (function () {
     const area = polsEN.reduce((s, p) => s + Math.abs(areaFirmada(p[0])) - p.slice(1).reduce((t, h) => t + Math.abs(areaFirmada(h)), 0), 0);
     if (area < 10) return { ok: false, error: 'La linde es demasiado pequeña.' };
 
-    const th = ((+d.rumbo % 360) + 360) % 360, t = th * RAD;
+    // Rumbo verdadero con 3 decimales, siempre: lo que se ve, lo que se calcula y lo que va al USB es lo mismo.
+    const th = Math.round(((+d.rumbo % 360) + 360) % 360 * 1000) / 1000 % 360, t = th * RAD;
     const dir = [Math.sin(t), Math.cos(t)], nor = [Math.cos(t), -Math.sin(t)];
     const aUV = (p) => [p[0] * dir[0] + p[1] * dir[1], p[0] * nor[0] + p[1] * nor[1]];
     const deUV = (u, v) => pl.de(u * dir[0] + v * nor[0], u * dir[1] + v * nor[1]);
@@ -540,6 +545,15 @@ const Nucleo = (function () {
       ok: true, avisos, areaHa: area / 10000, netaHa, metrosLineales: metros, tresbolillo: !!dlt, plantasLineo: nLineo,
       perimetro: polsEN.reduce((s, p) => s + perimetro(p[0]), 0), nFilas: filas.length, nArboles: nArb,
       transversales, ab, partidores, dibujoFilas, arboles, todos, contorno: pols.map((p) => p[0]),
+      /* Desfase de p [lon, lat] con la malla, mirando en el sentido del rumbo: dFila > 0 = a la derecha de la
+         fila más cercana; dArbol > 0 = por delante del árbol más cercano de esa fila (m). */
+      desfase: (p) => {
+        const q = aUV(pl.a(p)), v0 = vmin + ret + dF, k = Math.round((q[1] - v0) / calle), us = Math.abs(k) % 2 ? usImpar : usPar;
+        if (!us.length) return null;
+        const i = primeroMayorIgual(us, q[0]), j = i >= us.length || (i > 0 && q[0] - us[i - 1] < us[i] - q[0]) ? i - 1 : i;
+        const dFila = q[1] - (v0 + k * calle), dArbol = q[0] - us[j];
+        return { fila: k + 1, dFila, dArbol, distancia: Math.hypot(dFila, dArbol) };
+      },
     };
   }
 
@@ -610,7 +624,9 @@ const Nucleo = (function () {
       return r;
     });
     const todos = geoms.flatMap((g) => partesDe(g).flat());
-    const caja = [Math.min(...todos.map((p) => p[0])), Math.min(...todos.map((p) => p[1])), Math.max(...todos.map((p) => p[0])), Math.max(...todos.map((p) => p[1]))];
+    // Con un bucle: Math.min(...lista) revienta la pila con cientos de miles de puntos.
+    const caja = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const p of todos) { caja[0] = Math.min(caja[0], p[0]); caja[1] = Math.min(caja[1], p[1]); caja[2] = Math.max(caja[2], p[0]); caja[3] = Math.max(caja[3], p[1]); }
     const cab = (total) => {
       const h = new DataView(new ArrayBuffer(100));
       h.setInt32(0, 9994, false); h.setInt32(24, total / 2, false); h.setInt32(28, 1000, true); h.setInt32(32, tipo, true);
@@ -699,6 +715,10 @@ const Nucleo = (function () {
         { ruta: base + 'LineFeature.dbf', datos: dbf(LINEFEATURE, r.transversales.map(() => [fecha, hh.sinCero, 'FW2020.0', 1517, 'Line', null, null, null, null]), f) });
       const cx = (b.caja[0] + b.caja[2]) / 2, cy = (b.caja[1] + b.caja[3]) / 2;
       archivos.push({ ruta: base + cx.toFixed(5) + 'E' + cy.toFixed(5) + 'N.pos', datos: new Uint8Array(0) });
+      // El diseño completo, para releerlo idéntico (en el USB no caben zonas, huecos ni retranqueo).
+      // Va dentro de AgGPS (la pantalla ya tiene ahí carpetas suyas) para que el Plan B también lo copie.
+      archivos.push({ ruta: 'AgGPS/Plantadora/' + cli + '/' + fin + '/' + cam + '.json',
+        datos: utf8(JSON.stringify({ plantadora: 2, cliente: c.cliente, finca: c.finca, campo: c.campo, origen: c.origen || '', guardado: c.guardado || f.getTime(), diseno: c.diseno })) });
       for (const [k, v] of [['c', cli], ['f', fin], ['k', cam]]) if (!dic[k].includes(v)) dic[k].push(v);
     }
     const bloques = ['[Client]\r\n' + dic.c.join('\r\n'), '[Farm]\r\n' + dic.f.join('\r\n'), '[Field]\r\n' + dic.k.join('\r\n'),
@@ -827,7 +847,7 @@ const Nucleo = (function () {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const q of poligonos) for (const v of q[0]) { x0 = Math.min(x0, v[0]); x1 = Math.max(x1, v[0]); y0 = Math.min(y0, v[1]); y1 = Math.max(y1, v[1]); }
     const pl = plano((x0 + x1) / 2, (y0 + y1) / 2), a = pl.a(A), b = pl.a(B);
-    out.rumbo = ((Math.atan2(b[0] - a[0], b[1] - a[1]) * 180 / Math.PI) + 360) % 360;
+    out.rumbo = Math.round((((Math.atan2(b[0] - a[0], b[1] - a[1]) * 180 / Math.PI) + 360) % 360) * 1000) / 1000 % 360;  // 3 decimales
     const sw = parseFloat((tabla[i] || {}).SwathWidth);
     if (sw > 0) out.calle = sw;
     out.ancla = { fila: A };
@@ -1053,7 +1073,7 @@ const ControlGps = L.Control.extend({
 new ControlGps().addTo(mapa);
 function alternarGps() {
   const b = document.querySelector('.boton-gps');
-  if (vigia !== null) { navigator.geolocation.clearWatch(vigia); vigia = null; capaGps.clearLayers(); b.classList.remove('activo'); return; }
+  if (vigia !== null) { navigator.geolocation.clearWatch(vigia); vigia = null; capaGps.clearLayers(); b.classList.remove('activo'); estado.gps = null; pintarDesfase(); return; }
   if (!navigator.geolocation) return aviso('Esta tablet no da la posición.', true);
   centrado = false; b.classList.add('activo');
   vigia = navigator.geolocation.watchPosition((pos) => {
@@ -1063,9 +1083,27 @@ function alternarGps() {
     L.circle(q, { radius: pos.coords.accuracy, color: '#1565c0', weight: 1, fillOpacity: 0.1, interactive: false }).addTo(capaGps);
     L.circleMarker(q, { radius: 8, color: '#fff', fillColor: '#1565c0', fillOpacity: 1, weight: 3, interactive: false }).addTo(capaGps);
     if (!centrado) { centrado = true; mapa.setView(q, Math.max(mapa.getZoom(), 18)); aviso('Posición con ± ' + fmt(pos.coords.accuracy, 0) + ' m.'); }
+    estado.precision = pos.coords.accuracy; pintarDesfase();
   }, () => { aviso('No se pudo saber la posición. Activa la ubicación.', true); if (vigia !== null) alternarGps(); },
   { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
 }
+/* Desfase en directo: a cuánto está la posición de la fila y del árbol del diseño más cercanos.
+   Para comprobar el replanteo con un tutor ya puesto. Con el GPS de la tablet (± varios metros) solo orienta. */
+function pintarDesfase() {
+  const caja = $('desfase'), r = estado.resultado;
+  if (!estado.gps || vigia === null || !r) { caja.hidden = true; return; }
+  const d = r.desfase(estado.gps);
+  if (!d || d.distancia > 50) { caja.hidden = true; return; }
+  const cm = (x) => (Math.abs(x) < 1 ? fmt(Math.abs(x) * 100, 0) + ' cm' : fmt(Math.abs(x), 2) + ' m');
+  if (Math.abs(d.dFila) < 0.005) d.dFila = 0;
+  if (Math.abs(d.dArbol) < 0.005) d.dArbol = 0;
+  caja.innerHTML = 'Fila ' + d.fila + ': <b>' + cm(d.dFila) + '</b> ' + (d.dFila >= 0 ? 'a la derecha' : 'a la izquierda')
+    + ' · árbol: <b>' + cm(d.dArbol) + '</b> ' + (d.dArbol >= 0 ? 'por delante' : 'por detrás')
+    + '<br><span style="font-size:0.8rem;opacity:0.85">Mirando a ' + fmt(r.ab.rumbo, 1) + '°. GPS ± ' + fmt(estado.precision || 0, 1) + ' m'
+    + (estado.precision > 0.5 ? ': con este GPS solo orienta, no sirve para medir centímetros.' : '') + '</span>';
+  caja.hidden = false;
+}
+
 function posicionActual() {
   return new Promise((ok, mal) => {
     if (estado.gps && vigia !== null) return ok(estado.gps);
@@ -1440,7 +1478,9 @@ $('bZona').onclick = () => ponerModo('zona', 'Toca los vértices de la zona sin 
 /* ---------------------------------------------------------------- rumbo */
 /* Rumbo verdadero: ángulo con el meridiano (norte geográfico) en el centro del campo, no el de la cuadrícula UTM. */
 function rumboGrados(a, b) { return Nucleo.rumboRad(a, b) * 180 / Math.PI; }
-function ponerRumbo(g) { $('rumbo').value = fmt(((g % 360) + 360) % 360, 2).replace(/\./g, ''); recalcular(); }
+/* El rumbo va siempre con 3 decimales: lo que se ve es exactamente lo que se usa y lo que va al USB. */
+const rumbo3 = (g) => Math.round(((((g % 360) + 360) % 360)) * 1000) / 1000 % 360;
+function ponerRumbo(g) { $('rumbo').value = fmt(rumbo3(g), 3).replace(/\./g, ''); recalcular(); }
 function rumboDeLado(p) {
   if (!estado.poligonos) return aviso('Primero carga la linde.', true);
   const pl = Nucleo.plano(p[0], p[1]), q = pl.a(p);
@@ -1486,7 +1526,7 @@ for (const id of ['cliente', 'finca', 'campo']) $(id).addEventListener('input', 
 function disenoActual() {
   return {
     poligonos: estado.poligonos, piezas: estado.piezas, zonas: estado.zonas.map((z) => ({ anillo: z.anillo, retranqueo: z.retranqueo })),
-    calle: num('calle'), paso: num('paso'), retranqueo: num('retranqueo'), rumbo: num('rumbo'), tresbolillo: $('chkTresbolillo').checked,
+    calle: num('calle'), paso: num('paso'), retranqueo: num('retranqueo'), rumbo: isFinite(num('rumbo')) ? rumbo3(num('rumbo')) : NaN, tresbolillo: $('chkTresbolillo').checked,
     desplFilas: num('dFilas') || 0, desplPlantas: num('dPlantas') || 0, ancla: estado.ancla,
     partidor: $('chkPartidor').checked ? { largo: num('largoLineo'), ancho: num('anchoPartidor') } : null,
   };
@@ -1496,7 +1536,7 @@ function recalcular() {
   $('infoLinde').textContent = estado.poligonos ? estado.piezas.length + (estado.piezas.length === 1 ? ' pieza.' : ' piezas unidas en un solo campo.')
     : 'Sin linde. Si eliges varios recintos se unen en un solo campo.';
   const caja = $('resultado');
-  contar(); plantasLineo(); $('notaAncla').hidden = !estado.ancla; pintarPendientes();
+  contar(); plantasLineo(); $('notaAncla').hidden = !estado.ancla; pintarPendientes(); pintarDesfase();
   clearTimeout(guardarBorrador.t); guardarBorrador.t = setTimeout(guardarBorrador, 1500);
   if (!estado.poligonos || !isFinite(num('rumbo'))) { caja.innerHTML = '<p class="nota">Falta ' + (!estado.poligonos ? 'la linde' : 'el rumbo') + '.</p>'; return; }
   const r = Nucleo.calcular(disenoActual());
@@ -1518,7 +1558,7 @@ function recalcular() {
     + '<dt>Árboles</dt><dd>' + fmt(r.nArboles, 0) + (r.netaHa > 0 ? ' (' + fmt(r.nArboles / r.netaHa, 0) + ' por ha neta)' : '') + '</dd>'
     + '<dt>Transversales</dt><dd>' + fmt(r.transversales.length, 0) + (r.tresbolillo ? ' (diagonales)' : '') + '</dd>'
     + (r.partidores.length ? '<dt>Partidores</dt><dd>' + fmt(r.partidores.length, 0) + '</dd>' : '')
-    + '<dt>Línea AB</dt><dd>' + fmt(r.ab.largo, 1) + ' m a ' + fmt(r.ab.rumbo, 2) + '° verdaderos</dd>'
+    + '<dt>Línea AB</dt><dd>' + fmt(r.ab.largo, 1) + ' m a ' + fmt(r.ab.rumbo, 3) + '° verdaderos</dd>'
     + '<dt>Punto A</dt><dd class="coord">' + c(r.ab.a) + '</dd>'
     + '<dt>Punto B</dt><dd class="coord">' + c(r.ab.b) + '</dd></dl>'
     + '<p class="nota">Hectáreas netas: linde menos retranqueo, zonas sin plantar y partidores. Metros lineales: del primer al último árbol de cada tramo de fila. Coordenadas: latitud ; longitud (ETRS89).</p>';
@@ -1688,9 +1728,11 @@ $('bNuevo').onclick = async () => {
 /* ------------------------------------------------- cargar un campo hecho */
 /* Lee una carpeta AgGPS (o un campo suelto, o el .zip del Plan B) y lista los campos que trae. */
 const ARCHIVOS_CAMPO = /^(boundary|swaths|linefeature)\.(shp|dbf)$/i;
+const esDiseno = (ruta) => /(^|\/)plantadora\/[^/]+\/[^/]+\/[^/]+\.json$/i.test(ruta);
 function camposDeArchivos(archivos) {
-  const porCarpeta = new Map();
+  const porCarpeta = new Map(), disenos = new Map();
   for (const a of archivos) {
+    if (esDiseno(a.ruta)) { const q = a.ruta.split('/'); disenos.set(q.slice(-3).join('/').replace(/\.json$/i, '').toLowerCase(), a.datos); continue; }
     const partes = a.ruta.split('/').filter(Boolean), nombre = partes.pop();
     if (!ARCHIVOS_CAMPO.test(nombre)) continue;
     const clave = partes.join('/');
@@ -1702,7 +1744,7 @@ function camposDeArchivos(archivos) {
     if (!f['boundary.shp']) continue;
     const p = carpeta.split('/'), i = p.findIndex((x) => x.toLowerCase() === 'data');
     const [cliente, finca, campo] = i >= 0 && p.length - i - 1 >= 3 ? p.slice(i + 1, i + 4) : ['', '', p[p.length - 1] || 'Campo'];
-    out.push({ cliente, finca, campo, leer: (n) => f[n.toLowerCase()] || null });
+    out.push({ cliente, finca, campo, leer: (n) => f[n.toLowerCase()] || null, json: disenos.get([cliente, finca, campo].join('/').toLowerCase()) || null });
   }
   return out.sort((a, b) => (a.cliente + a.finca + a.campo).localeCompare(b.cliente + b.finca + b.campo, 'es'));
 }
@@ -1710,7 +1752,7 @@ async function leerCarpeta(dir, ruta, out, nivel) {
   if (nivel > 6) return;
   for await (const [nombre, h] of dir.entries()) {
     if (h.kind === 'directory') await leerCarpeta(h, ruta + nombre + '/', out, nivel + 1);
-    else if (ARCHIVOS_CAMPO.test(nombre)) out.push({ ruta: ruta + nombre, datos: new Uint8Array(await (await h.getFile()).arrayBuffer()) });
+    else if (ARCHIVOS_CAMPO.test(nombre) || esDiseno(ruta + nombre)) out.push({ ruta: ruta + nombre, datos: new Uint8Array(await (await h.getFile()).arrayBuffer()) });
   }
 }
 function mostrarCamposLeidos(lista) {
@@ -1724,6 +1766,19 @@ function mostrarCamposLeidos(lista) {
 function cargarCampo(c) {
   let x;
   try { x = Nucleo.leerCampo(c.leer); } catch (err) { return aviso('No se pudo leer «' + c.campo + '»: ' + err.message, true); }
+  // Si el USB trae el diseño completo y cuadra con lo que hay en el campo, se abre tal cual (con zonas, huecos y retranqueo).
+  if (c.json) {
+    try {
+      const j = JSON.parse(new TextDecoder().decode(c.json)), d = j.diseno;
+      const dr = Math.abs(((x.rumbo - d.rumbo) % 180 + 270) % 180 - 90);
+      if (d && dr < 0.002 && Math.abs((x.calle || d.calle) - d.calle) < 0.001) {
+        abrirCampo({ id: null, cliente: j.cliente || c.cliente, finca: j.finca || c.finca, campo: j.campo || c.campo, origen: j.origen, diseno: d });
+        estado.idEditando = null; estado.huellaGuardada = ''; $('camposLeidos').innerHTML = '';
+        return aviso('Campo «' + (j.campo || c.campo) + '» cargado con su diseño completo (zonas, huecos y retranqueo incluidos).');
+      }
+      aviso('El diseño guardado no cuadra con el campo del USB (¿se cambió en la pantalla?): se abre lo que hay en el USB.', true);
+    } catch (e) { /* diseño ilegible: se sigue con lo del USB */ }
+  }
   ponerModo(null);
   estado.idEditando = null; estado.zonas = []; estado.areaConteo = null;
   if (c.cliente) $('cliente').value = c.cliente;
@@ -1820,6 +1875,38 @@ $('bUsb').onclick = async () => {
     // Si eligió la carpeta AgGPS en vez de la raíz, se escribe dentro de ella sin duplicarla.
     const quitar = raiz.name.toLowerCase() === 'aggps' ? 'AgGPS/' : '';
     if (!quitar && raiz.name.toLowerCase() === 'data') throw new Error('Has elegido la carpeta «Data». Elige la raíz del USB o la carpeta AgGPS.');
+    // ¿Ya hay campos en el USB? Se pregunta si se borran antes. Solo se tocan AgGPS/Data y AgGPS/Plantadora:
+    // el resto de AgGPS (Autopilot, AB Lines, Diagnostics…) es de la pantalla y no se toca nunca.
+    let ag = raiz;
+    if (!quitar) { try { ag = await raiz.getDirectoryHandle('AgGPS'); } catch (e) { ag = null; } }
+    let borrarTodo = false;
+    const dataUsb = ag ? await ag.getDirectoryHandle('Data').catch(() => null) : null;
+    if (dataUsb) {
+      const hay = [];
+      let conTrabajo = 0;
+      for await (const [cli, hc] of dataUsb.entries()) if (hc.kind === 'directory')
+        for await (const [fin, hf] of hc.entries()) if (hf.kind === 'directory')
+          for await (const [cam, hk] of hf.entries()) if (hk.kind === 'directory') {
+            hay.push(cli + ' / ' + fin + ' / ' + cam);
+            for await (const [, he] of hk.entries()) if (he.kind === 'directory') { conTrabajo++; break; }
+          }
+      if (hay.length) {
+        const r = await preguntar('El USB ya tiene ' + hay.length + (hay.length === 1 ? ' campo: ' : ' campos: ') + hay.slice(0, 6).join('; ') + (hay.length > 6 ? '…' : '')
+          + (conTrabajo ? '. ' + (hay.length === 1 ? 'Tiene' : conTrabajo === 1 ? 'Uno tiene' : conTrabajo + ' de ellos tienen') + ' trabajos guardados por la pantalla (lo plantado).' : '.') + ' ¿Qué hago?', [
+          ['anadir', 'Dejarlos y añadir los nuevos', 'principal'], ['borrar', 'Borrarlos y pasar solo los nuevos', 'peligro'], ['cancelar', 'Cancelar']]);
+        if (r === 'cancelar') return;
+        if (r === 'borrar' && conTrabajo) {
+          const r2 = await preguntar('Se van a borrar también los trabajos que guardó la pantalla en ' + (conTrabajo === 1 ? 'ese campo' : conTrabajo + ' campos') + '. No se puede deshacer. ¿Seguro?', [
+            ['si', 'Sí, borrar todo', 'peligro'], ['no', 'No, cancelar']]);
+          if (r2 !== 'si') return;
+        }
+        borrarTodo = r === 'borrar';
+      }
+    }
+    if (borrarTodo) {
+      for await (const [n] of dataUsb.entries()) await dataUsb.removeEntry(n, { recursive: true });
+      try { await ag.removeEntry('Plantadora', { recursive: true }); } catch (e) { /* no había */ }
+    }
     let hechos = 0;
     const carpeta = async (partes) => { let d = raiz; for (const p of partes) d = await d.getDirectoryHandle(p, { create: true }); return d; };
     for (const a of archivos) {
@@ -1833,7 +1920,9 @@ $('bUsb').onclick = async () => {
         // Se une con el que ya hay para no borrar de la pantalla los clientes, fincas y campos de antes.
         try {
           const viejo = new TextDecoder('windows-1252').decode(await (await (await d.getFileHandle(nombre)).getFile()).arrayBuffer());
-          datos = new Uint8Array(Nucleo.cp1252(Nucleo.unirDiccionario(viejo, new TextDecoder('windows-1252').decode(a.datos))));
+          // Si se han borrado los campos, también sus clientes, fincas y campos del diccionario (lo demás se conserva).
+          const base = borrarTodo ? viejo.replace(/\[(Client|Farm|Field)\][^[]*/g, '') : viejo;
+          datos = new Uint8Array(Nucleo.cp1252(Nucleo.unirDiccionario(base, new TextDecoder('windows-1252').decode(a.datos))));
         } catch (e) { /* no había diccionario */ }
       }
       const w = await (await d.getFileHandle(nombre, { create: true })).createWritable();
