@@ -5,19 +5,21 @@
    - Librerías del CDN (Leaflet, Turf): se guardan al instalar y se refrescan por detrás. Sin ellas la
      página no arranca, así que tienen que estar aunque no haya red.
    - Mapas, SIGPAC, Catastro y terreno: no se guardan (pesan mucho y cambian); sin red no se ven. */
-const CACHE = 'plantadora-v2';
+const CACHE = 'plantadora-2026.11.23';  // cambiarlo en cada publicación con cambios en sw.js
 const CDN = 'https://cdnjs.cloudflare.com/';
 const LIBRERIAS = [
   'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css',
   'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/Turf.js/6.5.0/turf.min.js',
 ];
-const PROPIOS = ['./plantadora.html', './manifest.webmanifest', './icono-192.png', './icono-512.png'];
+const PROPIOS = ['./plantadora.html', './manifest.webmanifest', './icono-192.png', './icono-512.png', './icono-mascara.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => Promise.all([
     c.addAll(PROPIOS),
-    ...LIBRERIAS.map((u) => fetch(u, { mode: 'cors' }).then((r) => (r.ok ? c.put(u, r) : null)).catch(() => null)),
+    // Si no se pueden guardar las librerías, la instalación falla y se reintenta en la próxima visita con red:
+    // sin ellas la app no arrancaría en el campo.
+    ...LIBRERIAS.map((u) => fetch(u, { mode: 'cors' }).then((r) => { if (!r.ok) throw new Error(u); return c.put(u, r); })),
   ])));
   self.skipWaiting();
 });
@@ -31,7 +33,8 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(r.url);
   if (url.origin === self.location.origin) {
     e.respondWith((async () => {
-      const copia = await caches.match(r, { ignoreSearch: true }) || await caches.match('./plantadora.html');
+      // La página como respaldo solo al abrir la app (no para un icono u otro archivo que no esté guardado).
+      const copia = await caches.match(r, { ignoreSearch: true }) || (r.mode === 'navigate' ? await caches.match('./plantadora.html') : null);
       const red = fetch(r, { cache: 'no-cache' }).then((resp) => guardar(r, resp));
       // Con copia guardada no se espera a la red más de 3 s; sin copia, se espera lo que haga falta.
       if (!copia) return red;
