@@ -132,8 +132,15 @@ code { font-family: var(--mono); font-size: 0.88em; background: var(--soft); pad
       <label class="boton" for="fZip" style="flex-direction:row;align-items:center;color:var(--accent);font-size:0.95rem">Cargar .zip</label>
       <input id="fZip" type="file" accept=".zip,application/zip" hidden>
     </div>
-    <p class="nota">Abre un campo ya generado (carpeta <code>AgGPS</code> o su .zip) para retocarlo encima del original.</p>
+    <p class="nota">Abre un campo ya generado (carpeta <code>AgGPS</code> o su .zip) para retocarlo encima del original. Si la pantalla ya ha trabajado en él, se ve también lo plantado.</p>
     <div id="camposLeidos" class="botones"></div>
+    <div id="plantado" hidden>
+      <h3 id="plantadoTitulo" style="margin:4px 0 0;font-size:0.98rem"></h3>
+      <p id="plantadoFecha" class="nota"></p>
+      <div id="plantadoCapas" class="botones" style="gap:0 14px"></div>
+      <div id="plantadoRes"></div>
+      <div class="botones"><button id="bQuitarPlantado" type="button" class="peligro">Quitar lo plantado</button></div>
+    </div>
   </section>
 
   <section>
@@ -464,6 +471,7 @@ const Nucleo = (function () {
   /* d = {poligonos:[[exterior, ...huecos]] (o anillo + huecos, formato antiguo), calle, paso, retranqueo,
           rumbo (grados desde el norte geográfico), desplFilas, desplPlantas, tresbolillo,
           partidor:{largo, ancho}|null, zonas:[{anillo, retranqueo}]}; coordenadas [lon, lat]. */
+  const AB_MAX = 500;  // largo máximo de la línea AB (m)
   function calcular(d) {
     const avisos = [];
     const crudo = d.poligonos && d.poligonos.length ? d.poligonos : [[d.anillo || [], ...(d.huecos || [])]];
@@ -590,9 +598,42 @@ const Nucleo = (function () {
       }
     }
 
-    let mejor = null;
-    for (const f of filas) for (const tr of f.tramos) if (!mejor || tr.n > mejor.tr.n) mejor = { f, tr };
-    const ab = { a: deUV(mejor.tr.a, mejor.f.v), b: deUV(mejor.tr.b, mejor.f.v), largo: mejor.tr.b - mejor.tr.a, rumbo: th };
+    /* El Boundary es la linde (el recinto bruto, como en los diseños de la oficina). Las transversales sobresalen media
+       calle de la última fila: con un retranqueo menor que media calle, su punta queda fuera de la linde. */
+    let fueraN = 0, fueraM = 0;
+    for (const t of transversales) for (const p of t) {
+      const q = pl.a(p);
+      if (polsEN.some((pz) => dentro(q, pz))) continue;
+      let dmin = Infinity;
+      for (const pz of polsEN) for (const r of pz) for (let i = 0; i < r.length - 1; i++) {
+        const [ax, ay] = r[i], [bx, by] = r[i + 1], L2 = (bx - ax) ** 2 + (by - ay) ** 2;
+        const k = L2 ? Math.max(0, Math.min(1, ((q[0] - ax) * (bx - ax) + (q[1] - ay) * (by - ay)) / L2)) : 0;
+        dmin = Math.min(dmin, Math.hypot(q[0] - ax - k * (bx - ax), q[1] - ay - k * (by - ay)));
+      }
+      if (dmin > 0.005) { fueraN++; fueraM = Math.max(fueraM, dmin); }  // en la misma linde no cuenta
+    }
+    if (fueraN) avisos.push(fueraN + ' puntas de transversal quedan fuera de la linde (hasta ' + String(Math.round(fueraM * 100) / 100).replace('.', ',') + ' m): el retranqueo es menor que media calle. Sube el retranqueo a ' + String(calle / 2).replace('.', ',') + ' m o más.');
+
+    /* Línea AB (como linea_ab_central del plugin): en la fila más cercana al centro
+       a lo ancho (punto medio entre la primera y la última fila) de las que miden al menos la mitad que la más
+       larga, del primer al último árbol de esa fila y como mucho AB_MAX m centrados en su medio, con A y B en
+       árboles. No puede salirse de la linde: si la fila la cruza entre esos dos árboles, va a la siguiente. */
+    const largoFila = (f) => f.us[f.us.length - 1] - f.us[0];
+    const tope = 0.5 * Math.max(...filas.map(largoFila)), vC = (filas[0].v + filas[filas.length - 1].v) / 2;
+    const candidatas = filas.filter((f) => largoFila(f) >= tope).sort((x, y) => Math.abs(x.v - vC) - Math.abs(y.v - vC) || x.k - y.k);
+    let ab = null;
+    for (const f of candidatas) {
+      const us = f.us.slice().sort((x, y) => x - y);
+      let ua = us[0], ub = us[us.length - 1];
+      if (ub - ua > AB_MAX + 1e-6) {
+        const m = (ua + ub) / 2;
+        ua = us.find((u) => u >= m - AB_MAX / 2 - 1e-6);
+        ub = us.slice().reverse().find((u) => u <= m + AB_MAX / 2 + 1e-6);
+      }
+      const x = { a: deUV(ua, f.v), b: deUV(ub, f.v), largo: ub - ua, rumbo: th };
+      if (!ab) ab = x;
+      if (f.tramos.some((tr) => tr.a <= ua + 1e-9 && ub <= tr.b + 1e-9)) { ab = x; break; }
+    }
 
     /* Partidores: recta en mitad del hueco, solo a lo largo de las filas que tienen árboles a sus dos lados. */
     const partidores = [], franjas = [];
@@ -762,16 +803,9 @@ const Nucleo = (function () {
   function horas(f) {
     const h12 = f.getHours() % 12 || 12, mm = String(f.getMinutes()).padStart(2, '0'), ss = String(f.getSeconds()).padStart(2, '0');
     const ap = f.getHours() < 12 ? 'am' : 'pm';
-    return { cero: String(h12).padStart(2, '0') + ':' + mm + ':' + ss + ap, sinCero: h12 + ':' + mm + ':' + ss + ap };
+    return { cero: String(h12).padStart(2, '0') + ':' + mm + ':' + ss + ap, sinCero: h12 + ':' + mm + ':' + ss + ap, oficina: f.getHours() + ':' + mm };
   }
   function fechaDbf(f) { return f.getFullYear() + String(f.getMonth() + 1).padStart(2, '0') + String(f.getDate()).padStart(2, '0'); }
-  function idTrimble(texto) {
-    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
-    for (const ch of texto) { const c = ch.codePointAt(0); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
-    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-    return '5023' + ((h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0')).slice(0, 12).toUpperCase();
-  }
   /* Rumbo verdadero de A a B en radianes [0, 2π), con los radios del elipsoide (no de una esfera). */
   function rumboRad(a, b) {
     const pl = plano((a[0] + b[0]) / 2, (a[1] + b[1]) / 2), p = pl.a(a), q = pl.a(b);
@@ -798,8 +832,11 @@ const Nucleo = (function () {
       const lineas = [{ nombre: 'plantacion', seg: [r.ab.a, r.ab.b] }, ...r.partidores];
       const s = shp(3, lineas.map((l) => l.seg));
       archivos.push({ ruta: base + 'Swaths.shp', datos: s.shp }, { ruta: base + 'Swaths.shx', datos: s.shx },
-        { ruta: base + 'Swaths.dbf', datos: dbf(SWATHS, lineas.map((l, i) => [fecha, hh.cero, '4.80', 0, l.nombre, 0, 0,
-          rumboRad(l.seg[0], l.seg[1]), idTrimble(cli + '|' + fin + '|' + cam + '|' + l.nombre + '|' + i + '|' + fecha), 7, +c.diseno.calle, 1]), f) });
+        // Como las escribe la oficina (Farm Works): sin Version, UniqueID, Operation ni NumRows, Length/Dist1/Dist2
+        // a 0, hora «H:MM» de 24 h, Id 0 (recta de 2 vértices). SwathWidth = la calle, para que la pantalla trace
+        // las paralelas a la calle y no al ancho del apero.
+        { ruta: base + 'Swaths.dbf', datos: dbf(SWATHS, lineas.map((l) => [fecha, hh.oficina, null, l.seg.length === 2 ? 0 : 1, l.nombre, 0, 0, 0,
+          null, null, +c.diseno.calle, null]), f) });
       const lf = shp(3, r.transversales);
       archivos.push({ ruta: base + 'LineFeature.shp', datos: lf.shp }, { ruta: base + 'LineFeature.shx', datos: lf.shx },
         { ruta: base + 'LineFeature.dbf', datos: dbf(LINEFEATURE, r.transversales.map(() => [fecha, hh.sinCero, 'FW2020.0', 1517, 'Line', null, null, null, null]), f) });
@@ -872,13 +909,15 @@ const Nucleo = (function () {
   }
 
   /* ------------------------------------------------------------- lectura */
-  /* Shapefile de polilíneas o polígonos -> [[parte de [x, y]...]...], una entrada por registro. */
+  /* Shapefile de polilíneas o polígonos -> [[parte de [x, y]...]...], una entrada por registro.
+     Los de puntos (Point, PointZ, PointM: PointFeature, Track3D) dan una parte de un punto: [[[x, y]]]. */
   function leerShp(b) {
     const dv = new DataView(b.buffer, b.byteOffset, b.byteLength), geoms = [];
     let p = 100;
     while (p + 8 <= b.length) {
-      const largo = dv.getInt32(p + 4, false) * 2, c = p + 8;
-      if (dv.getInt32(c, true) !== 0 && largo >= 44) {
+      const largo = dv.getInt32(p + 4, false) * 2, c = p + 8, tipo = largo >= 4 ? dv.getInt32(c, true) : 0;
+      if ((tipo === 1 || tipo === 11 || tipo === 21) && largo >= 20) geoms.push([[[dv.getFloat64(c + 4, true), dv.getFloat64(c + 12, true)]]]);
+      else if (tipo !== 0 && largo >= 44) {
         const np = dv.getInt32(c + 36, true), n = dv.getInt32(c + 40, true), o = c + 44 + 4 * np, ini = [];
         for (let i = 0; i < np; i++) ini.push(dv.getInt32(c + 44 + 4 * i, true));
         ini.push(n);
@@ -928,7 +967,8 @@ const Nucleo = (function () {
     if (!sshp) { out.avisos.push('No trae Swaths: falta el rumbo y la calle.'); return out; }
     const lineas = leerShp(sshp), tabla = sdbf ? leerDbf(sdbf) : [];
     let i = tabla.findIndex((f) => /^plantaci/i.test(f.Name || ''));
-    if (i < 0) i = 0;
+    // La pantalla reescribe Swaths y deja las líneas borradas como «DELETED» sin geometría: se salta a la primera viva.
+    if (i < 0) i = Math.max(0, lineas.findIndex((g, k) => !/^deleted$/i.test((tabla[k] || {}).Name || '') && g[0] && g[0].length >= 2));
     const ab = (lineas[i] || [])[0];
     if (!ab || ab.length < 2) { out.avisos.push('La línea AB está vacía.'); return out; }
     const A = ab[0], B = ab[ab.length - 1];
@@ -1000,6 +1040,205 @@ const Nucleo = (function () {
     if (out.partidores && !out.partidor) out.avisos.push('Trae partidores pero no se han podido recuperar: vuelve a ponerlos.');
     out.ancla.arbol = pl.de(a[0] + u0 * u[0], a[1] + u0 * u[1]);
     return out;
+  }
+
+  /* Archivos de una carpeta AgGPS o de un .zip ([{ruta, datos}]) -> campos [{cliente, finca, campo, archivos, json}].
+     archivos = {ruta dentro de la carpeta del campo: bytes}; json = el diseño completo de AgGPS/Plantadora, si viene.
+     Un campo es una carpeta con Boundary.shp o PointFeature.shp, o con subcarpetas de trabajo de la pantalla (Coverage,
+     Track3D: su carpeta padre es el campo). Cliente / finca / campo salen de lo que va tras «Data», así que también
+     vale una copia con la carpeta repetida (AgGPS/AgGPS/Data/...). */
+  const ARCHIVOS_CAMPO = /^(boundary|swaths|linefeature|pointfeature)\.(shp|dbf)$|^eventhistory\.dbf$/i;
+  const ARCHIVOS_TRABAJO = /^(coverage|track3d[^/]*)\.(shp|dbf)$/i;
+  const esDiseno = (ruta) => /(^|\/)plantadora\/[^/]+\/[^/]+\/[^/]+\.json$/i.test(ruta);
+  function agruparCampos(archivos) {
+    const porCarpeta = new Map(), disenos = new Map();
+    const de = (k) => { if (!porCarpeta.has(k)) porCarpeta.set(k, {}); return porCarpeta.get(k); };
+    for (const a of archivos) {
+      if (esDiseno(a.ruta)) { const q = a.ruta.split('/'); disenos.set(q.slice(-3).join('/').replace(/\.json$/i, '').toLowerCase(), a.datos); continue; }
+      const partes = a.ruta.split('/').filter(Boolean), nombre = partes.pop();
+      if (ARCHIVOS_CAMPO.test(nombre)) de(partes.join('/'))[nombre] = a.datos;
+      else if (ARCHIVOS_TRABAJO.test(nombre) && partes.length >= 2) { const sub = partes.pop(); de(partes.join('/'))[sub + '/' + nombre] = a.datos; }
+    }
+    const out = [];
+    for (const [carpeta, f] of porCarpeta) {
+      const ks = Object.keys(f).map((k) => k.toLowerCase());
+      if (!ks.some((k) => k === 'boundary.shp' || k === 'pointfeature.shp' || /\/(coverage|track3d[^/]*)\.shp$/.test(k))) continue;
+      const p = carpeta.split('/'), i = p.findIndex((x) => x.toLowerCase() === 'data');
+      const [cliente, finca, campo] = i >= 0 && p.length - i - 1 >= 3 ? p.slice(i + 1, i + 4) : ['', '', p[p.length - 1] || 'Campo'];
+      out.push({ cliente, finca, campo, archivos: f, json: disenos.get([cliente, finca, campo].join('/').toLowerCase()) || null });
+    }
+    return out.sort((a, b) => (a.cliente + a.finca + a.campo).localeCompare(b.cliente + b.finca + b.campo, 'es'));
+  }
+
+  /* Trabajo que guarda la pantalla en la carpeta del campo. `archivos`: {ruta dentro de la carpeta del campo: bytes}, p. ej.
+     'PointFeature.shp', 'EventHistory.dbf', 'plantar/Coverage.shp', 'plantar/Track3D_18Apr18_0941.shp' (cada .shp con su .dbf).
+     PointFeature: Id 905 = planta, 904 = marca, cualquier otro va a «otros». Track3D son PUNTOS del recorrido, en orden.
+     -> {plantas, marcas, otros: [[lon, lat]...], recorridos: [{trabajo, puntos}], cobertura: [{trabajo, anillos}],
+         transversales: [[lon, lat]...] de LineFeature, trabajos: [nombres], desde, hasta: 'AAAA-MM-DD hh:mm' o null,
+         hay: si trae algo hecho por la pantalla}. */
+  function leerTrabajo(archivos) {
+    const idx = new Map(Object.keys(archivos).map((k) => [k.toLowerCase(), archivos[k]]));
+    const lee = (n) => idx.get(n.toLowerCase()) || null;
+    const out = { plantas: [], marcas: [], otros: [], recorridos: [], cobertura: [], transversales: [], trabajos: [], desde: null, hasta: null };
+    const fechas = [], trabajos = new Set();
+    // 'AAAAMMDD' + '07:00:08pm' (o '10:26') -> 'AAAA-MM-DD hh:mm' (hora local de la pantalla).
+    const sello = (f, h) => {
+      if (!/^\d{8}$/.test(f || '')) return;
+      const m = /^(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?\s*([ap]m)?$/i.exec(String(h || '').trim());
+      let t = '';
+      if (m) { const hh = m[3] ? (+m[1] % 12) + (/p/i.test(m[3]) ? 12 : 0) : +m[1]; t = ' ' + String(hh).padStart(2, '0') + ':' + m[2]; }
+      fechas.push(f.slice(0, 4) + '-' + f.slice(4, 6) + '-' + f.slice(6) + t);
+    };
+    const tabla = (n) => { const b = lee(n); try { return b ? leerDbf(b) : []; } catch (e) { return []; } };
+    // La pantalla deja a veces un punto sin posición (0, 0 o 1e308): se toma el del dbf o se descarta.
+    const valido = (p) => p && Math.abs(p[0]) <= 180 && Math.abs(p[1]) <= 90 && !(p[0] === 0 && p[1] === 0);
+    const pshp = lee('PointFeature.shp');
+    if (pshp) {
+      const t = tabla('PointFeature.dbf');
+      leerShp(pshp).forEach((g, k) => {
+        const f = t[k] || {};
+        let p = g[0] && g[0][0];
+        if (!valido(p)) { const q = [parseFloat(f.Longitude), parseFloat(f.Latitude)]; p = valido(q) ? q : null; }
+        if (!p) return;
+        const id = parseInt(f.Id, 10);
+        (id === 905 ? out.plantas : id === 904 ? out.marcas : out.otros).push(p);
+        sello(f.Date, f.Time);
+      });
+    }
+    // Las transversales que tenía la pantalla: las plantas «Line» se apuntan al cruzarlas.
+    const lshp = lee('LineFeature.shp');
+    if (lshp) try { out.transversales = leerShp(lshp).map((g) => g[0]).filter((l) => l && l.length >= 2); } catch (e) { /* ilegible: sin ellas */ }
+    for (const f of tabla('EventHistory.dbf')) { if (f.Event) trabajos.add(f.Event); sello(f.Date_Open, f.Time_Open); sello(f.Date_Close, f.Time_Close); }
+    // Subcarpetas de trabajo (nombre libre: «plantar», «olivar»…): cobertura y recorrido.
+    for (const ruta of Object.keys(archivos).sort()) {
+      const m = /^([^/]+)\/((coverage)|track3d[^/]*)\.shp$/i.exec(ruta);
+      if (!m) continue;
+      const trabajo = m[1], base = ruta.slice(0, -4);
+      let geoms;
+      try { geoms = leerShp(archivos[ruta]); } catch (e) { continue; }
+      trabajos.add(trabajo);
+      if (m[3]) {
+        for (const g of geoms) { const anillos = g.map(cerrar).filter((r) => r.length >= 4); if (anillos.length) out.cobertura.push({ trabajo, anillos }); }
+        for (const f of tabla(base + '.dbf')) sello(f.DateClosed, f.TimeClosed);
+      } else {
+        const puntos = geoms.map((g) => g[0] && g[0][0]).filter(valido);
+        if (puntos.length) out.recorridos.push({ trabajo, puntos });
+      }
+    }
+    fechas.sort();
+    if (fechas.length) { out.desde = fechas[0]; out.hasta = fechas[fechas.length - 1]; }
+    out.trabajos = [...trabajos];
+    out.hay = !!(out.plantas.length || out.marcas.length || out.otros.length || out.recorridos.length || out.cobertura.length);
+    return out;
+  }
+
+  /* Plantas registradas ([[lon, lat]...]) frente al diseño. o = {r, d, transversales, umbral}:
+     r sale de calcular(d) (puede faltar: entonces no hay olivos con los que comparar); d da la linde, las zonas, el
+     retranqueo y el marco; transversales: [[lon, lat]...] por línea (las del USB si las trae, si no las del diseño).
+     Por planta: distancia a su transversal, al olivo del diseño más cercano, error de sitio (con transversales: la
+     distancia a la suya junto con la de su fila del diseño; sin ellas: la de su olivo) y estado: 0 bien, 1 a más de
+     `umbral` m de su sitio, 2 fuera de la zona neta (en el retranqueo o en una zona sin plantar),
+     3 fuera de la linde. Las lindes llevan `umbral` de tolerancia: un olivo justo en el borde del retranqueo plantado
+     2 cm fuera no cuenta como fuera. Faltan: olivos sin ninguna planta a menos de media distancia entre árboles (o media
+     calle, si es menor). */
+  function compararPlantado(plantas, o) {
+    const r = o.r && o.r.ok !== false ? o.r : null, d = o.d || {}, tol = o.umbral == null ? 0.10 : +o.umbral, n = plantas.length;
+    const todos = r ? r.todos : [], nA = todos.length / 2;
+    const crudo = d.poligonos && d.poligonos.length ? d.poligonos : d.anillo ? [[d.anillo, ...(d.huecos || [])]] : [];
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    const caja = (v) => { x0 = Math.min(x0, v[0]); x1 = Math.max(x1, v[0]); y0 = Math.min(y0, v[1]); y1 = Math.max(y1, v[1]); };
+    for (const q of crudo) for (const v of q[0] || []) caja(v);
+    if (!isFinite(x0)) plantas.forEach(caja);
+    const pl = plano(isFinite(x0) ? (x0 + x1) / 2 : 0, isFinite(y0) ? (y0 + y1) / 2 : 0);
+    const pols = crudo.map((q) => q.map(cerrar).filter((a) => a.length >= 4).map((a) => a.map(pl.a))).filter((q) => q.length);
+    const zonas = (d.zonas || []).map((z) => ({ a: cerrar(z.anillo).map(pl.a), ret: Math.max(0, +z.retranqueo || 0) })).filter((z) => z.a.length >= 4);
+    const ret = Math.max(0, +d.retranqueo || 0), paso = +d.paso > 0 ? +d.paso : 1, calle = +d.calle > 0 ? +d.calle : 1;
+    const aSeg = (p, ax, ay, bx, by) => {
+      const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy, t = l2 ? Math.max(0, Math.min(1, ((p[0] - ax) * dx + (p[1] - ay) * dy) / l2)) : 0;
+      return Math.hypot(p[0] - ax - t * dx, p[1] - ay - t * dy);
+    };
+    const aBorde = (p, a) => { let m = Infinity; for (let i = 0; i < a.length - 1; i++) m = Math.min(m, aSeg(p, a[i][0], a[i][1], a[i + 1][0], a[i + 1][1])); return m; };
+    // Tramos de las transversales en metros, con su caja para descartar deprisa los que quedan lejos.
+    const segs = [];
+    for (const l of o.transversales || []) {
+      const q = l.map(pl.a);
+      for (let i = 0; i < q.length - 1; i++) segs.push([q[i][0], q[i][1], q[i + 1][0], q[i + 1][1],
+        Math.min(q[i][0], q[i + 1][0]), Math.max(q[i][0], q[i + 1][0]), Math.min(q[i][1], q[i + 1][1]), Math.max(q[i][1], q[i + 1][1])]);
+    }
+    const aTransversal = (p) => {
+      let m = Infinity;
+      for (const s of segs) {
+        if (p[0] < s[4] - m || p[0] > s[5] + m || p[1] < s[6] - m || p[1] > s[7] + m) continue;
+        m = Math.min(m, aSeg(p, s[0], s[1], s[2], s[3]));
+      }
+      return m;
+    };
+    // Rejillas de olivos y de plantas, en metros, con celdas del tamaño del marco.
+    const lado = Math.max(paso, calle, 0.5), clave = (ix, iy) => ix * 1048576 + iy;
+    const rejilla = (xy, cuantos) => {
+      const g = new Map();
+      for (let i = 0; i < cuantos; i++) {
+        const k = clave(Math.floor(xy[2 * i] / lado), Math.floor(xy[2 * i + 1] / lado));
+        let c = g.get(k); if (!c) g.set(k, (c = [])); c.push(i);
+      }
+      return g;
+    };
+    const oxy = new Float64Array(2 * nA);
+    for (let i = 0; i < nA; i++) { const q = pl.a([todos[2 * i], todos[2 * i + 1]]); oxy[2 * i] = q[0]; oxy[2 * i + 1] = q[1]; }
+    const pxy = new Float64Array(2 * n);
+    plantas.forEach((p, i) => { const q = pl.a(p); pxy[2 * i] = q[0]; pxy[2 * i + 1] = q[1]; });
+    const gO = rejilla(oxy, nA), gP = rejilla(pxy, n);
+    // Más cercano: anillos de celdas hasta que el mejor quede dentro del radio ya explorado (como mucho `kmax` celdas).
+    const cercano = (g, xy, x, y, kmax) => {
+      const ix = Math.floor(x / lado), iy = Math.floor(y / lado);
+      if (!(Math.abs(ix) < 1e7 && Math.abs(iy) < 1e7)) return Infinity;  // punto sin posición real: no se busca
+      let mejor = Infinity;
+      for (let k = 0; k <= kmax; k++) {
+        for (let a = ix - k; a <= ix + k; a++) for (let b = iy - k; b <= iy + k; b++) {
+          if (Math.max(Math.abs(a - ix), Math.abs(b - iy)) !== k) continue;
+          const c = g.get(clave(a, b));
+          if (c) for (const j of c) { const dd = Math.hypot(xy[2 * j] - x, xy[2 * j + 1] - y); if (dd < mejor) mejor = dd; }
+        }
+        if (mejor <= k * lado) break;
+      }
+      return mejor;
+    };
+    const dist = new Float64Array(n).fill(Infinity), distT = new Float64Array(n).fill(Infinity), sitio = new Float64Array(n).fill(Infinity);
+    const estado = new Uint8Array(n), fila = new Float64Array(n).fill(NaN), dArbol = [];
+    let lejos = 0, fueraNeta = 0, fueraLinde = 0;
+    for (let i = 0; i < n; i++) {
+      const q = [pxy[2 * i], pxy[2 * i + 1]];
+      if (nA) dist[i] = cercano(gO, oxy, q[0], q[1], 10);
+      if (segs.length) distT[i] = aTransversal(q);
+      const s = r && r.desfase ? r.desfase(plantas[i]) : null;
+      if (s) { fila[i] = Math.abs(s.dFila); dArbol.push(Math.abs(s.dArbol)); }
+      const pieza = pols.find((a) => dentro(q, a));
+      const borde = pols.length ? Math.min(...pols.map((a) => Math.min(...a.map((an) => aBorde(q, an))))) : Infinity;
+      if (pols.length && !pieza && borde > tol) { estado[i] = 3; fueraLinde++; }
+      else if ((pieza && borde < ret - tol) || zonas.some((z) => dentro(q, [z.a]) || aBorde(q, z.a) < z.ret - tol)) { estado[i] = 2; fueraNeta++; }
+    }
+    // Las que quedan a más de 10 celdas de todo olivo (fuera de la finca): a mano, si son pocas; si no, se quedan en infinito.
+    const sueltas = [];
+    if (nA) for (let i = 0; i < n; i++) if (dist[i] === Infinity) sueltas.push(i);
+    if (sueltas.length <= 500) for (const i of sueltas) for (let j = 0; j < nA; j++) dist[i] = Math.min(dist[i], Math.hypot(oxy[2 * j] - pxy[2 * i], oxy[2 * j + 1] - pxy[2 * i + 1]));
+    const orden = (v) => Array.from(v).filter(isFinite).sort((a, b) => a - b);
+    const mediana = (v) => (v.length ? (v.length % 2 ? v[(v.length - 1) / 2] : (v[v.length / 2 - 1] + v[v.length / 2]) / 2) : null);
+    const cifras = (v) => { const s = orden(v); return { mediana: mediana(s), p95: s.length ? s[Math.max(0, Math.ceil(0.95 * s.length) - 1)] : null, max: s.length < v.length && s.length ? Infinity : s.length ? s[s.length - 1] : null, n: s.length }; };
+    const olivo = cifras(dist), transversal = cifras(distT);
+    // Las plantas caen en sus transversales pero lejos de los olivos: el diseño abierto no es el que tenía la pantalla
+    // (otro marco, otra AB…). Entonces no se mira el diseño: el sitio es solo la transversal.
+    const cuadra = !(nA && segs.length && transversal.mediana <= tol && olivo.mediana > Math.max(3 * transversal.mediana, tol));
+    // Error de sitio: con transversales, la distancia a la suya junto con la de su fila del diseño; sin ellas, la de su olivo.
+    for (let i = 0; i < n; i++) {
+      sitio[i] = segs.length ? (cuadra && fila[i] === fila[i] ? Math.hypot(distT[i], fila[i]) : distT[i]) : dist[i];
+      const mal = nA || segs.length ? !(sitio[i] <= tol) : false;
+      if (mal) { lejos++; if (!estado[i]) estado[i] = 1; }
+    }
+    const R = Math.min(paso, calle) / 2, faltanPos = [];
+    if (cuadra) for (let i = 0; i < nA; i++) if (!(n && cercano(gP, pxy, oxy[2 * i], oxy[2 * i + 1], 1) <= R)) faltanPos.push([todos[2 * i], todos[2 * i + 1]]);
+    return { nPlantas: n, nDiseno: nA, dist, distT, sitio, estado, umbral: tol, olivo, transversal, cifrasSitio: cifras(sitio), cuadra,
+      medianaFila: mediana(orden(fila)), medianaArbol: mediana(orden(dArbol)),
+      lejos, fueraNeta, fueraLinde, faltan: cuadra && nA ? faltanPos.length : null, faltanPos };
   }
 
   /* ----------------------------------------------------------- pendientes */
@@ -1111,7 +1350,7 @@ const Nucleo = (function () {
     return out;
   }
 
-  return { calcular, contarDentro, unirDiccionario, leerCampo, leerTiff, gradientes, clasificarPendientes, leerShp, leerDbf, unzip, paquete, zip, nombreSeguro, plano, cerrar, dentro, areaFirmada, cp1252, idTrimble, rumboRad };
+  return { calcular, contarDentro, unirDiccionario, leerCampo, agruparCampos, esArchivoCampo: (ruta, nombre) => ARCHIVOS_CAMPO.test(nombre) || ARCHIVOS_TRABAJO.test(nombre) || esDiseno(ruta), leerTrabajo, compararPlantado, leerTiff, gradientes, clasificarPendientes, leerShp, leerDbf, unzip, paquete, zip, nombreSeguro, plano, cerrar, dentro, areaFirmada, cp1252, rumboRad };
 })();
 if (typeof module !== 'undefined') module.exports = Nucleo;
 </script>
@@ -1123,7 +1362,7 @@ if (typeof L === 'undefined') {
     + 'No se ha podido cargar el mapa. Abre la app una vez con internet para que se guarde en la tablet; después funciona también sin cobertura.</p>');
   throw new Error('sin Leaflet');
 }
-const VERSION = '2026.11.23';
+const VERSION = '2026.11.25b';
 const $ = (id) => document.getElementById(id);
 const fmt = (x, d) => Number(x).toLocaleString('es-ES', { minimumFractionDigits: d, maximumFractionDigits: d });
 const num = (id) => parseFloat(String($(id).value).replace(/\s/g, '').replace(',', '.'));
@@ -1692,6 +1931,8 @@ function disenoActual() {
   };
 }
 function recalcular() {
+  // Lo plantado se vuelve a comparar con el diseño nuevo (después, sin frenar el recálculo).
+  clearTimeout(pintarPlantado.t); if (estado.plantado) pintarPlantado.t = setTimeout(pintarPlantado, 300);
   capaDiseno.clearLayers(); capaArboles.clearLayers(); estado.resultado = null; $('bGuardarCampo').disabled = true; $('bContar').disabled = true;
   $('infoLinde').textContent = estado.poligonos ? estado.piezas.length + (estado.piezas.length === 1 ? ' pieza.' : ' piezas unidas en un solo campo.')
     : 'Sin linde. Si eliges varios recintos se unen en un solo campo.';
@@ -1890,50 +2131,124 @@ $('bGuardarCampo').onclick = () => guardarCampo();
 $('bNuevo').onclick = async () => {
   if (!(await puedoDescartar())) return;
   estado.idEditando = null; estado.piezas = []; estado.zonas = []; estado.areaConteo = null; estado.ancla = null; $('camposLeidos').innerHTML = ''; $('campo').value = ''; $('rumbo').value = '';
-  $('dFilas').value = '0'; $('dPlantas').value = '0';
+  $('dFilas').value = '0'; $('dPlantas').value = '0'; estado.plantado = null; pintarPlantado();
   ponerModo(null); nuevaGeneracion(); pintarZonas(); actualizarLinde(); marcarGuardado();
 };
 
 /* ------------------------------------------------- cargar un campo hecho */
-/* Lee una carpeta AgGPS (o un campo suelto, o el .zip del Plan B) y lista los campos que trae. */
-const ARCHIVOS_CAMPO = /^(boundary|swaths|linefeature)\.(shp|dbf)$/i;
-const esDiseno = (ruta) => /(^|\/)plantadora\/[^/]+\/[^/]+\/[^/]+\.json$/i.test(ruta);
+/* Lee una carpeta AgGPS (o un campo suelto, o el .zip del Plan B) y lista los campos que trae (Nucleo.agruparCampos). */
 function camposDeArchivos(archivos) {
-  const porCarpeta = new Map(), disenos = new Map();
-  for (const a of archivos) {
-    if (esDiseno(a.ruta)) { const q = a.ruta.split('/'); disenos.set(q.slice(-3).join('/').replace(/\.json$/i, '').toLowerCase(), a.datos); continue; }
-    const partes = a.ruta.split('/').filter(Boolean), nombre = partes.pop();
-    if (!ARCHIVOS_CAMPO.test(nombre)) continue;
-    const clave = partes.join('/');
-    if (!porCarpeta.has(clave)) porCarpeta.set(clave, {});
-    porCarpeta.get(clave)[nombre.toLowerCase()] = a.datos;
-  }
-  const out = [];
-  for (const [carpeta, f] of porCarpeta) {
-    if (!f['boundary.shp']) continue;
-    const p = carpeta.split('/'), i = p.findIndex((x) => x.toLowerCase() === 'data');
-    const [cliente, finca, campo] = i >= 0 && p.length - i - 1 >= 3 ? p.slice(i + 1, i + 4) : ['', '', p[p.length - 1] || 'Campo'];
-    out.push({ cliente, finca, campo, leer: (n) => f[n.toLowerCase()] || null, json: disenos.get([cliente, finca, campo].join('/').toLowerCase()) || null });
-  }
-  return out.sort((a, b) => (a.cliente + a.finca + a.campo).localeCompare(b.cliente + b.finca + b.campo, 'es'));
+  return Nucleo.agruparCampos(archivos).map((c) => {
+    const idx = new Map(Object.keys(c.archivos).map((k) => [k.toLowerCase(), c.archivos[k]]));
+    return { ...c, leer: (n) => idx.get(n.toLowerCase()) || null, conTrabajo: [...idx.keys()].some((k) => k === 'pointfeature.shp' || k.includes('/')) };
+  });
 }
 async function leerCarpeta(dir, ruta, out, nivel) {
-  if (nivel > 6) return;
+  if (nivel > 8) return;  // raíz / AgGPS / AgGPS (copias con la carpeta repetida) / Data / cliente / finca / campo / trabajo
   for await (const [nombre, h] of dir.entries()) {
     if (h.kind === 'directory') await leerCarpeta(h, ruta + nombre + '/', out, nivel + 1);
-    else if (ARCHIVOS_CAMPO.test(nombre) || esDiseno(ruta + nombre)) out.push({ ruta: ruta + nombre, datos: new Uint8Array(await (await h.getFile()).arrayBuffer()) });
+    else if (Nucleo.esArchivoCampo(ruta + nombre, nombre)) out.push({ ruta: ruta + nombre, datos: new Uint8Array(await (await h.getFile()).arrayBuffer()) });
   }
 }
 function mostrarCamposLeidos(lista) {
   const caja = $('camposLeidos'); caja.innerHTML = '';
-  if (!lista.length) return aviso('No hay ningún campo (falta Boundary.shp).', true);
+  if (!lista.length) return aviso('No hay ningún campo (falta Boundary.shp y no hay nada plantado).', true);
   if (lista.length === 1) return puedoDescartar().then((ok) => ok && cargarCampo(lista[0]));
   const t = document.createElement('p'); t.className = 'nota'; t.style.width = '100%'; t.textContent = 'Hay ' + lista.length + ' campos. Toca el que quieras abrir:';
   caja.appendChild(t);
-  for (const c of lista) caja.appendChild(boton([c.cliente, c.finca, c.campo].filter(Boolean).join(' / '), async () => { if (await puedoDescartar()) cargarCampo(c); }));
+  for (const c of lista) caja.appendChild(boton([c.cliente, c.finca, c.campo].filter(Boolean).join(' / ') + (c.conTrabajo ? ' (con lo plantado)' : ''), async () => { if (await puedoDescartar()) cargarCampo(c); }));
 }
+
+/* ------------------------------------------- lo plantado por la pantalla */
+/* Plantas, marcas, recorrido y cobertura que deja la pantalla en el campo, encima del diseño y comparadas con él.
+   Se pinta en lienzo (pueden ser decenas de miles de plantas) y se vuelve a comparar cada vez que cambia el diseño. */
+mapa.createPane('cobertura').style.zIndex = 390;
+mapa.createPane('plantado').style.zIndex = 430;
+for (const p of ['cobertura', 'plantado']) mapa.getPane(p).style.pointerEvents = 'none';
+const lienzoPlantado = L.canvas({ pane: 'plantado', padding: 0.3 }), lienzoCobertura = L.canvas({ pane: 'cobertura', padding: 0.3 });
+const capasPlantado = { plantas: L.layerGroup(), faltan: L.layerGroup(), marcas: L.layerGroup(), recorrido: L.layerGroup(), cobertura: L.layerGroup() };
+const COLOR_PLANTA = ['#ffd600', '#ff1744', '#e040fb', '#e040fb'];  // bien, a más de 10 cm, fuera de la zona neta, fuera de la linde
+const MAX_FALTAN = 20000;
+function ponerPlantado(trabajo, c) {
+  estado.plantado = trabajo && trabajo.hay ? { ...trabajo, nombre: [c.cliente, c.finca, c.campo].filter(Boolean).join(' / ') } : null;
+  estado.verPlantado = estado.verPlantado || { plantas: true, faltan: true, marcas: true, recorrido: true, cobertura: true };
+  pintarPlantado();
+}
+function encuadrarPlantado() {
+  const w = estado.plantado;
+  if (!w) return;
+  const pts = w.plantas.concat(w.marcas, w.otros, ...w.recorridos.map((x) => x.puntos), ...w.cobertura.map((x) => x.anillos[0]));
+  if (pts.length) mapa.fitBounds(L.latLngBounds(pts.map(ll)), { padding: [30, 30], maxZoom: 19 });
+}
+const fechaEs = (s) => s.slice(8, 10) + '/' + s.slice(5, 7) + '/' + s.slice(0, 4) + s.slice(10);
+const medida = (m) => (m === Infinity ? 'muy lejos' : m == null || !isFinite(m) ? '-' : m >= 1 ? fmt(m, 2) + ' m' : fmt(m * 100, 1) + ' cm');
+function pintarPlantado() {
+  clearTimeout(pintarPlantado.t);
+  for (const g of Object.values(capasPlantado)) { g.clearLayers(); mapa.removeLayer(g); }
+  const w = estado.plantado, caja = $('plantadoRes');
+  $('plantado').hidden = !w; caja.innerHTML = ''; $('plantadoCapas').innerHTML = '';
+  if (!w) return;
+  $('plantadoTitulo').textContent = 'Lo plantado por la pantalla' + (w.nombre ? ': ' + w.nombre : '');
+  $('plantadoFecha').textContent = (w.desde ? (w.desde.slice(0, 10) === w.hasta.slice(0, 10) ? 'El ' + fechaEs(w.desde) + (w.hasta.length > 10 && w.hasta !== w.desde ? ' a ' + w.hasta.slice(11) : '') : 'Del ' + fechaEs(w.desde) + ' al ' + fechaEs(w.hasta)) : 'Sin fecha.')
+    + (w.trabajos.length ? ' Trabajo: ' + w.trabajos.join(', ') + '.' : '');
+  // Comparación con el diseño abierto (o, si no hay, solo con las transversales del USB y la linde).
+  const d = estado.poligonos ? disenoActual() : null, r = estado.resultado;
+  const trans = w.transversales.length ? w.transversales : r ? r.transversales : [];
+  let cmp = null;
+  if (w.plantas.length) { try { cmp = Nucleo.compararPlantado(w.plantas, { r, d, transversales: trans, umbral: 0.10 }); } catch (err) { aviso('No se ha podido comparar lo plantado: ' + mensajeError(err), true); } }
+  w.plantas.forEach((p, i) => L.circleMarker(ll(p), { renderer: lienzoPlantado, radius: 3, weight: 0, fillOpacity: 1, fillColor: COLOR_PLANTA[cmp ? cmp.estado[i] : 0], interactive: false }).addTo(capasPlantado.plantas));
+  if (cmp && cmp.faltanPos.length <= MAX_FALTAN) cmp.faltanPos.forEach((p) => L.circleMarker(ll(p), { renderer: lienzoPlantado, radius: 4, color: '#ff6d00', weight: 2, fill: false, interactive: false }).addTo(capasPlantado.faltan));
+  w.marcas.forEach((p) => L.circleMarker(ll(p), { renderer: lienzoPlantado, radius: 5, color: '#ffffff', weight: 2, fillColor: '#2962ff', fillOpacity: 1, interactive: false }).addTo(capasPlantado.marcas));
+  w.otros.forEach((p) => L.circleMarker(ll(p), { renderer: lienzoPlantado, radius: 4, color: '#1a1f14', weight: 1, fillColor: '#ffffff', fillOpacity: 1, interactive: false }).addTo(capasPlantado.marcas));
+  w.recorridos.forEach((x) => L.polyline(x.puntos.map(ll), { renderer: lienzoPlantado, color: '#7c4dff', weight: 2, opacity: 0.9, interactive: false }).addTo(capasPlantado.recorrido));
+  w.cobertura.forEach((x) => L.polygon(x.anillos.map((a) => a.map(ll)), { renderer: lienzoCobertura, stroke: false, fillColor: '#2962ff', fillOpacity: 0.28, interactive: false }).addTo(capasPlantado.cobertura));
+  // Casillas para encender y apagar cada capa (solo las que traen algo).
+  const casillas = [['plantas', 'Plantas (' + fmt(w.plantas.length, 0) + ')', w.plantas.length],
+    ['faltan', 'Faltan' + (cmp && cmp.faltan != null ? ' (' + fmt(cmp.faltan, 0) + ')' : ''), cmp && cmp.faltanPos.length && cmp.faltanPos.length <= MAX_FALTAN],
+    ['marcas', 'Marcas (' + fmt(w.marcas.length, 0) + ')' + (w.otros.length ? ' y otros puntos (' + fmt(w.otros.length, 0) + ')' : ''), w.marcas.length + w.otros.length],
+    ['recorrido', 'Recorrido', w.recorridos.length], ['cobertura', 'Cobertura', w.cobertura.length]];
+  for (const [k, texto, hay] of casillas) {
+    if (!hay) continue;
+    const l = document.createElement('label'); l.className = 'check';
+    const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = estado.verPlantado[k] !== false;
+    chk.onchange = () => { estado.verPlantado[k] = chk.checked; chk.checked ? capasPlantado[k].addTo(mapa) : mapa.removeLayer(capasPlantado[k]); };
+    l.append(chk, texto); $('plantadoCapas').appendChild(l);
+    if (chk.checked) capasPlantado[k].addTo(mapa);
+  }
+  if (!cmp) { caja.innerHTML = '<p class="nota">' + (w.plantas.length ? 'No se ha podido comparar.' : 'No hay plantas registradas.') + '</p>'; return; }
+  const pc = (x) => fmt(cmp.nPlantas ? x / cmp.nPlantas * 100 : 0, 1) + ' %', cif = (c) => 'mediana ' + medida(c.mediana) + ', p95 ' + medida(c.p95) + ', máx. ' + medida(c.max);
+  let html = '<dl class="datos"><dt>Plantas</dt><dd>' + fmt(cmp.nPlantas, 0) + '</dd>'
+    + '<dt>Olivos del diseño</dt><dd>' + (cmp.nDiseno ? fmt(cmp.nDiseno, 0) : 'sin diseño abierto') + '</dd>';
+  if (cmp.transversal.n) html += '<dt>A su transversal</dt><dd>' + cif(cmp.transversal) + '</dd>';
+  if (cmp.olivo.n && cmp.cuadra) html += '<dt>A su olivo</dt><dd>' + cif(cmp.olivo) + '</dd>';
+  if (cmp.medianaFila != null && cmp.cuadra) html += '<dt>Desvío</dt><dd>mediana ' + medida(cmp.medianaFila) + ' de lado y ' + medida(cmp.medianaArbol) + ' a lo largo de la fila</dd>';
+  if (cmp.transversal.n || cmp.nDiseno) html += '<dt>A más de 10 cm</dt><dd>' + fmt(cmp.lejos, 0) + ' (' + pc(cmp.lejos) + ')</dd>';
+  if (d) html += '<dt>Fuera de la zona neta</dt><dd>' + fmt(cmp.fueraNeta, 0) + '</dd><dt>Fuera de la linde</dt><dd>' + fmt(cmp.fueraLinde, 0) + '</dd>';
+  if (cmp.faltan != null) html += '<dt>Faltan</dt><dd>' + fmt(cmp.faltan, 0) + ' olivos del diseño sin planta</dd>';
+  caja.innerHTML = html + '</dl>';
+  const notas = [];
+  if (!cmp.cuadra) notas.push('Las plantas caen en sus transversales, pero no en los olivos del diseño abierto (mediana ' + medida(cmp.olivo.mediana) + '): no es el diseño que tenía la pantalla. Se compara solo con las transversales y no se cuentan las que faltan.');
+  if (cmp.faltanPos.length > MAX_FALTAN) notas.push('Faltan demasiados olivos para dibujarlos (¿falta media finca por plantar?).');
+  if (!d) notas.push('Sin linde abierta: no se puede saber qué plantas caen fuera.');
+  if (notas.length) { const ul = document.createElement('ul'); ul.className = 'avisos'; notas.forEach((a) => { const li = document.createElement('li'); li.textContent = a; ul.appendChild(li); }); caja.appendChild(ul); }
+  const p = document.createElement('p'); p.className = 'nota';
+  p.textContent = 'Plantas en amarillo: bien; en rojo: a más de 10 cm de su sitio; en morado: fuera de la zona neta o de la linde. Círculos naranjas: faltan. Marcas en azul, recorrido en violeta y cobertura en azul claro.'
+    + (w.transversales.length ? ' Las transversales son las del USB.' : '');
+  caja.appendChild(p);
+}
+$('bQuitarPlantado').onclick = () => { estado.plantado = null; pintarPlantado(); };
 function cargarCampo(c) {
   nuevaGeneracion();
+  // Lo que ha hecho la pantalla en el campo (plantas, marcas, recorrido, cobertura). Si no trae nada, todo sigue como antes.
+  let trabajo = null;
+  try { trabajo = Nucleo.leerTrabajo(c.archivos); } catch (err) { aviso('No se pudo leer lo plantado en «' + c.campo + '»: ' + mensajeError(err), true); }
+  const hayPlantado = !!(trabajo && trabajo.hay), nota = hayPlantado ? ' Trae lo plantado por la pantalla: míralo en el paso 1.' : '';
+  if (!c.leer('Boundary.shp')) {
+    $('camposLeidos').innerHTML = '';
+    if (!hayPlantado) return aviso('«' + c.campo + '» no trae linde (Boundary.shp) ni nada plantado.', true);
+    ponerPlantado(trabajo, c); encuadrarPlantado();
+    return aviso('«' + c.campo + '» no trae linde: se ve lo plantado' + (estado.resultado ? ', comparado con el diseño que tienes abierto.' : '. Para compararlo, abre su diseño de la lista.'), !estado.resultado);
+  }
   let x;
   try { x = Nucleo.leerCampo(c.leer); } catch (err) { return aviso('No se pudo leer «' + c.campo + '»: ' + err.message, true); }
   // Si el USB trae el diseño completo y cuadra con lo que hay en el campo, se abre tal cual (con zonas, huecos y retranqueo).
@@ -1948,7 +2263,8 @@ function cargarCampo(c) {
       if (d && lindeIgual && dr < 0.002 && Math.abs((x.calle || d.calle) - d.calle) < 0.001) {
         abrirCampo({ id: null, cliente: j.cliente || c.cliente, finca: j.finca || c.finca, campo: j.campo || c.campo, origen: j.origen, diseno: d });
         estado.idEditando = null; estado.huellaGuardada = ''; $('camposLeidos').innerHTML = '';
-        return aviso('Campo «' + (j.campo || c.campo) + '» cargado con su diseño completo (zonas, huecos y retranqueo incluidos).');
+        ponerPlantado(trabajo, c);
+        return aviso('Campo «' + (j.campo || c.campo) + '» cargado con su diseño completo (zonas, huecos y retranqueo incluidos).' + nota);
       }
       aviso('El diseño guardado no cuadra con el campo del USB (¿se cambió en la pantalla?): se abre lo que hay en el USB.', true);
     } catch (e) { /* diseño ilegible: se sigue con lo del USB */ }
@@ -1968,9 +2284,9 @@ function cargarCampo(c) {
   estado.ancla = x.ancla && x.ancla.arbol ? x.ancla : null;
   estado.piezas = x.poligonos.map((pol, k) => ({ id: 'U' + Date.now() + '-' + k, origen: 'Cargado: ' + c.campo + (x.poligonos.length > 1 ? ' (' + (k + 1) + ')' : ''), pol }));
   $('camposLeidos').innerHTML = '';
-  pintarZonas(); actualizarLinde(true);
+  pintarZonas(); actualizarLinde(true); ponerPlantado(trabajo, c);
   const falta = x.avisos.length ? ' ' + x.avisos.join(' ') : '';
-  aviso('Campo «' + c.campo + '» cargado. En el USB no vienen el retranqueo, las zonas sin plantar ni los huecos de la linde: revísalos antes de volver a exportar.' + falta, true);
+  aviso('Campo «' + c.campo + '» cargado. En el USB no vienen el retranqueo, las zonas sin plantar ni los huecos de la linde: revísalos antes de volver a exportar.' + falta + nota, true);
 }
 $('bCargarUsb').onclick = async () => {
   if (!window.showDirectoryPicker) return aviso('Este navegador no deja abrir carpetas: usa «Cargar .zip».', true);

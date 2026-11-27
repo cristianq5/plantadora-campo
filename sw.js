@@ -5,7 +5,7 @@
    - Librerías del CDN (Leaflet, Turf): se guardan al instalar y se refrescan por detrás. Sin ellas la
      página no arranca, así que tienen que estar aunque no haya red.
    - Mapas, SIGPAC, Catastro y terreno: no se guardan (pesan mucho y cambian); sin red no se ven. */
-const CACHE = 'plantadora-2026.11.23';  // cambiarlo en cada publicación con cambios en sw.js
+const CACHE = 'plantadora-2026.11.25b';  // cambiarlo en cada publicación con cambios en sw.js
 const CDN = 'https://cdnjs.cloudflare.com/';
 const LIBRERIAS = [
   'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css',
